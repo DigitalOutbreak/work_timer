@@ -86,6 +86,20 @@ enum TaskAction {
     Delete,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum StatsTab {
+    Overview,
+    Projects,
+    Timeline,
+    Details,
+}
+
+impl Default for StatsTab {
+    fn default() -> Self {
+        StatsTab::Overview
+    }
+}
+
 #[derive(Default)]
 struct WorkTimer {
     tasks: HashMap<String, Task>,
@@ -105,6 +119,8 @@ struct WorkTimer {
     dark_mode: bool,
     show_shortcuts: bool,
     show_settings: bool,
+    show_statistics: bool,
+    selected_stats_tab: StatsTab,
     ui_scale: f32,
     temporary_ui_scale: f32,
     focus_new_task: bool,
@@ -166,6 +182,8 @@ impl WorkTimer {
             dark_mode: true,
             show_shortcuts: false,
             show_settings: false,
+            show_statistics: false,
+            selected_stats_tab: StatsTab::Overview,
             ui_scale: default_scale,
             temporary_ui_scale: default_scale,
             focus_new_task: false,
@@ -369,22 +387,16 @@ impl WorkTimer {
         let folder_csv = format!("folder_{}.csv", sanitize_filename(folder_name));
         let _ = fs::remove_file(&folder_csv);
 
-        // Remove individual task CSV files for tasks in this folder
-        if let Ok(entries) = fs::read_dir(".") {
-            for entry in entries.flatten() {
-                if let Ok(file_name) = entry.file_name().into_string() {
-                    if file_name.ends_with(".csv") {
-                        // Check if this CSV belongs to a task in the folder
-                        if let Some(task) = self.tasks.values().find(|t| {
-                            t.folder.as_deref() == Some(folder_name) &&
-                            file_name == format!("{}.csv", sanitize_filename(&t.description))
-                        }) {
-                            let _ = fs::remove_file(&file_name);
-                        }
-                    }
-                }
+        // Remove individual task CSV files for tasks in this folder and the tasks themselves
+        self.tasks.retain(|_, task| {
+            if task.folder.as_deref() == Some(folder_name) {
+                // Remove the task's CSV file if it exists
+                let _ = fs::remove_file(format!("{}.csv", sanitize_filename(&task.description)));
+                false // Remove this task
+            } else {
+                true // Keep tasks from other folders
             }
-        }
+        });
 
         // Remove the folder from the folders list
         if let Some(index) = self.folders.iter().position(|f| f == folder_name) {
@@ -541,17 +553,111 @@ impl WorkTimer {
         self.save_tasks();
         self.save_folder_styles();
     }
+
+    fn calculate_folder_durations(&self) -> Vec<(String, i64)> {
+        let mut durations: HashMap<String, i64> = HashMap::new();
+        
+        for task in self.tasks.values() {
+            let folder = task.folder.clone().unwrap_or_else(|| "Uncategorized".to_string());
+            *durations.entry(folder).or_default() += task.get_current_duration();
+        }
+
+        let mut result: Vec<_> = durations.into_iter().collect();
+        result.sort_by_key(|(_, duration)| std::cmp::Reverse(*duration));
+        result
+    }
+
+    fn calculate_average_task_duration(&self) -> i64 {
+        if self.tasks.is_empty() {
+            return 0;
+        }
+        let total: i64 = self.tasks.values().map(|t| t.get_current_duration()).sum();
+        total / self.tasks.len() as i64
+    }
+
+    fn format_duration(seconds: i64) -> String {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        let seconds = seconds % 60;
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    }
+
+    fn is_any_dialog_open(&self) -> bool {
+        self.show_new_folder_dialog || 
+        self.show_clear_folders_confirm || 
+        self.show_clear_confirm || 
+        self.show_clear_folder_confirm.is_some() || 
+        self.show_delete_task_confirm.is_some() || 
+        self.show_shortcuts || 
+        self.show_settings || 
+        self.show_add_task_dialog ||
+        self.show_statistics
+    }
 }
 
 impl eframe::App for WorkTimer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.configure_theme(ctx);
 
+        // Handle global shortcuts that should work even when dialogs are open
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
+            self.dark_mode = !self.dark_mode;
+        }
+
+        // Handle statistics tab navigation globally
+        if self.show_statistics {
+            if ctx.input(|i| {
+                i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::OpenBracket)
+            }) {
+                // Move left in tabs
+                self.selected_stats_tab = match self.selected_stats_tab {
+                    StatsTab::Overview => StatsTab::Details,  // Wrap around to end
+                    StatsTab::Projects => StatsTab::Overview,
+                    StatsTab::Timeline => StatsTab::Projects,
+                    StatsTab::Details => StatsTab::Timeline,
+                };
+            } else if ctx.input(|i| {
+                i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::CloseBracket)
+            }) {
+                // Move right in tabs
+                self.selected_stats_tab = match self.selected_stats_tab {
+                    StatsTab::Overview => StatsTab::Projects,
+                    StatsTab::Projects => StatsTab::Timeline,
+                    StatsTab::Timeline => StatsTab::Details,
+                    StatsTab::Details => StatsTab::Overview,  // Wrap around to start
+                };
+            }
+        }
+
+        // Handle dialog closing with Escape or Cmd+W
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape) || (i.modifiers.command && i.key_pressed(egui::Key::W))) {
+            if self.show_new_folder_dialog {
+                self.show_new_folder_dialog = false;
+                self.new_folder_input.clear();
+            } else if self.show_clear_folders_confirm {
+                self.show_clear_folders_confirm = false;
+            } else if self.show_clear_confirm {
+                self.show_clear_confirm = false;
+            } else if self.show_clear_folder_confirm.is_some() {
+                self.show_clear_folder_confirm = None;
+            } else if self.show_delete_task_confirm.is_some() {
+                self.show_delete_task_confirm = None;
+            } else if self.show_shortcuts {
+                self.show_shortcuts = false;
+            } else if self.show_settings {
+                self.temporary_ui_scale = self.ui_scale; // Reset temporary scale
+                self.show_settings = false;
+            } else if self.show_add_task_dialog {
+                self.show_add_task_dialog = false;
+                self.add_task_to_folder = None;
+                self.new_task_in_folder.clear();
+            } else if self.show_statistics {
+                self.show_statistics = false;
+            }
+        }
+
         // Handle keyboard shortcuts and navigation
-        if !self.show_new_folder_dialog && !self.show_clear_folders_confirm && !self.show_clear_confirm 
-            && !self.show_clear_folder_confirm.is_some() && !self.show_delete_task_confirm.is_some() 
-            && !self.show_shortcuts && !self.show_settings && !self.show_add_task_dialog {
-            
+        if !self.is_any_dialog_open() {
             // Handle space bar for play/pause
             if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
                 let folders = self.get_folders();
@@ -565,17 +671,15 @@ impl eframe::App for WorkTimer {
                         let tasks = self.get_tasks_by_folder();
                         if let Some(task_ids) = tasks.get(folder_name.as_str()) {
                             if let Some(task_idx) = self.focused_task_index {
-                                if let Some(task_id) = task_ids.get(task_idx) {
-                                    if let Some(task) = self.tasks.get(task_id) {
-                                        let action = if task.start_time.is_some() {
-                                            TaskAction::Pause
-                                        } else if task.is_paused {
-                                            TaskAction::Resume
-                                        } else {
-                                            TaskAction::Start
-                                        };
-                                        self.handle_task_action(task_id, action);
-                                    }
+                                if let Some(task) = self.tasks.get(task_ids[task_idx].as_str()) {
+                                    let action = if task.start_time.is_some() {
+                                        TaskAction::Pause
+                                    } else if task.is_paused {
+                                        TaskAction::Resume
+                                    } else {
+                                        TaskAction::Start
+                                    };
+                                    self.handle_task_action(task_ids[task_idx].as_str(), action);
                                 }
                             }
                         }
@@ -670,34 +774,36 @@ impl eframe::App for WorkTimer {
             }
         }
 
-        // Handle keyboard shortcuts
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
-            self.show_new_folder_dialog = true;
-            self.focus_new_folder = true;
-        }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E)) {
-            if let Err(e) = self.export_to_csv() {
-                self.export_message = Some((format!("Error exporting CSV: {}", e), 3.0));
+        // Handle keyboard shortcuts only when no dialog is open
+        if !self.is_any_dialog_open() {
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
+                self.show_new_folder_dialog = true;
+                self.focus_new_folder = true;
             }
-        }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
-            self.dark_mode = !self.dark_mode;
-        }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::T)) {
-            if let Some(focused_idx) = self.focused_folder_index {
-                // If a folder is focused, open the add task dialog for that folder
-                if let Some(folder_name) = self.folders.get(focused_idx) {
-                    self.show_add_task_dialog = true;
-                    self.add_task_to_folder = Some(folder_name.clone());
-                    self.new_task_in_folder.clear();
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E)) {
+                if let Err(e) = self.export_to_csv() {
+                    self.export_message = Some((format!("Error exporting CSV: {}", e), 3.0));
                 }
-            } else {
-                // If no folder is focused, focus the quick add task input
-                self.focus_new_task = true;
             }
-        }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
-            self.show_settings = true;
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::T)) {
+                if let Some(focused_idx) = self.focused_folder_index {
+                    // If a folder is focused, open the add task dialog for that folder
+                    if let Some(folder_name) = self.folders.get(focused_idx) {
+                        self.show_add_task_dialog = true;
+                        self.add_task_to_folder = Some(folder_name.clone());
+                        self.new_task_in_folder.clear();
+                    }
+                } else {
+                    // If no folder is focused, focus the quick add task input
+                    self.focus_new_task = true;
+                }
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+                self.show_statistics = true;
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Comma)) {
+                self.show_settings = true;
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -715,6 +821,10 @@ impl eframe::App for WorkTimer {
 
                 if ui.button("⌨").clicked() {
                     self.show_shortcuts = true;
+                }
+
+                if ui.button("📊").clicked() {
+                    self.show_statistics = true;
                 }
 
                 ui.separator();
@@ -812,7 +922,7 @@ impl eframe::App for WorkTimer {
                     .resizable(false)
                     .show(ctx, |ui| {
                         ui.label(format!(
-                            "Are you sure you want to delete the folder '{}'? This will remove the folder from the list. Tasks will remain in the system but will be uncategorized.",
+                            "Are you sure you want to delete the folder '{}'? This will remove the folder and all its tasks. This cannot be undone.",
                             folder_name
                         ));
                         ui.horizontal(|ui| {
@@ -914,7 +1024,7 @@ impl eframe::App for WorkTimer {
                 }
             }
 
-            // Add the shortcuts popup window after the top bar
+            // Add the shortcuts popup window
             if self.show_shortcuts {
                 egui::Window::new("Keyboard Shortcuts")
                     .collapsible(false)
@@ -941,6 +1051,14 @@ impl eframe::App for WorkTimer {
 
                                 ui.label("⌘N");
                                 ui.label("New Folder");
+                                ui.end_row();
+
+                                ui.label("⌘S");
+                                ui.label("Show Statistics");
+                                ui.end_row();
+
+                                ui.label("⌘,");
+                                ui.label("Show Settings");
                                 ui.end_row();
 
                                 ui.label("Enter");
@@ -1001,6 +1119,189 @@ impl eframe::App for WorkTimer {
                                     }
                                 },
                             );
+                        });
+                    });
+            }
+
+            // Add the statistics window after the shortcuts window
+            if self.show_statistics {
+                egui::Window::new("Statistics")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_size([400.0, 500.0])
+                    .show(ctx, |ui| {
+                        let content_height = ui.available_height() - 40.0; // Reserve space for close button
+
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut self.selected_stats_tab, StatsTab::Overview, "Overview");
+                            ui.selectable_value(&mut self.selected_stats_tab, StatsTab::Projects, "Projects");
+                            ui.selectable_value(&mut self.selected_stats_tab, StatsTab::Timeline, "Timeline");
+                            ui.selectable_value(&mut self.selected_stats_tab, StatsTab::Details, "Details");
+                        });
+                        
+                        ui.separator();
+
+                        egui::ScrollArea::vertical()
+                            .max_height(content_height)
+                            .show(ui, |ui| {
+                                match self.selected_stats_tab {
+                                    StatsTab::Overview => {
+                                        ui.heading("Overview");
+                                        ui.add_space(8.0);
+                                        
+                                        // Filter tasks to only include those in existing folders or uncategorized
+                                        let current_tasks: Vec<_> = self.tasks.values()
+                                            .filter(|task| {
+                                                match &task.folder {
+                                                    None => true, // Include uncategorized tasks
+                                                    Some(folder) => self.folders.contains(folder) // Only include tasks from existing folders
+                                                }
+                                            })
+                                            .collect();
+                                        
+                                        // Total tracked time
+                                        let total_time: i64 = current_tasks.iter()
+                                            .map(|t| t.get_current_duration())
+                                            .sum();
+                                        ui.label(format!("Total Time Tracked: {}", Self::format_duration(total_time)));
+                                        
+                                        // Active tasks
+                                        let active_tasks = current_tasks.iter()
+                                            .filter(|t| t.start_time.is_some())
+                                            .count();
+                                        ui.label(format!("Currently Active Tasks: {}", active_tasks));
+                                        
+                                        // Average task duration
+                                        let avg_duration = if !current_tasks.is_empty() {
+                                            total_time / current_tasks.len() as i64
+                                        } else {
+                                            0
+                                        };
+                                        ui.label(format!("Average Task Duration: {}", Self::format_duration(avg_duration)));
+                                        
+                                        ui.add_space(16.0);
+                                        
+                                        // Quick stats grid
+                                        egui::Grid::new("stats_grid")
+                                            .num_columns(2)
+                                            .spacing([40.0, 8.0])
+                                            .show(ui, |ui| {
+                                                ui.label("Total Projects:");
+                                                ui.label(format!("{}", self.folders.len()));
+                                                ui.end_row();
+                                                
+                                                ui.label("Total Tasks:");
+                                                ui.label(format!("{}", current_tasks.len()));
+                                                ui.end_row();
+                                                
+                                                ui.label("Completed Tasks:");
+                                                ui.label(format!("{}", current_tasks.iter()
+                                                    .filter(|t| t.total_duration > 0 && !t.is_paused && t.start_time.is_none())
+                                                    .count()));
+                                                ui.end_row();
+                                            });
+                                    },
+                                    StatsTab::Projects => {
+                                        ui.heading("Project Statistics");
+                                        ui.add_space(8.0);
+                                        
+                                        // Project time distribution
+                                        let folder_durations = self.calculate_folder_durations();
+                                        
+                                        // Skip rendering if no data
+                                        if folder_durations.is_empty() {
+                                            ui.label("No project data available");
+                                            return;
+                                        }
+                                        
+                                        let max_duration = folder_durations[0].1;
+                                        if max_duration == 0 {
+                                            ui.label("No time tracked in any projects");
+                                            return;
+                                        }
+                                        
+                                        // Use a fixed width for consistent layout
+                                        let available_width = ui.available_width();
+                                        let label_width = available_width * 0.3;
+                                        let bar_width = available_width * 0.7;
+                                        
+                                        for (folder, duration) in folder_durations {
+                                            ui.horizontal(|ui| {
+                                                // Fixed width for the folder name
+                                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                    ui.set_min_width(label_width);
+                                                    ui.label(&folder);
+                                                });
+                                                
+                                                // Fixed width for the progress bar
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.set_min_width(bar_width);
+                                                    let progress = duration as f32 / max_duration as f32;
+                                                    let bar = egui::ProgressBar::new(progress)
+                                                        .text(Self::format_duration(duration))
+                                                        .animate(false);  // Disable animation
+                                                    ui.add(bar);
+                                                });
+                                            });
+                                        }
+                                    },
+                                    StatsTab::Timeline => {
+                                        ui.heading("Activity Timeline");
+                                        ui.add_space(8.0);
+                                        
+                                        ui.label("Coming soon: Activity visualization");
+                                        ui.add_space(8.0);
+                                        ui.label("This tab will show your activity patterns over time,");
+                                        ui.label("including daily and weekly summaries.");
+                                    },
+                                    StatsTab::Details => {
+                                        ui.heading("Detailed Statistics");
+                                        ui.add_space(8.0);
+                                        
+                                        // Most time-consuming tasks
+                                        ui.label("Top Tasks by Duration:");
+                                        ui.add_space(4.0);
+                                        
+                                        // Filter tasks to only include those in existing folders or uncategorized
+                                        let mut tasks: Vec<_> = self.tasks.values()
+                                            .filter(|task| {
+                                                match &task.folder {
+                                                    None => true, // Include uncategorized tasks
+                                                    Some(folder) => self.folders.contains(folder) // Only include tasks from existing folders
+                                                }
+                                            })
+                                            .collect();
+                                        
+                                        if tasks.is_empty() {
+                                            ui.label(egui::RichText::new("No tasks available")
+                                                .italics()
+                                                .color(egui::Color32::from_rgb(128, 128, 128)));
+                                            return;
+                                        }
+                                        
+                                        tasks.sort_by_key(|t| std::cmp::Reverse(t.get_current_duration()));
+                                        
+                                        for task in tasks.iter().take(5) {
+                                            ui.horizontal(|ui| {
+                                                // Show folder name along with task description
+                                                let folder_name = task.folder.as_deref().unwrap_or("Uncategorized");
+                                                ui.label(format!("{} ({})", task.description, folder_name));
+                                                
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.label(Self::format_duration(task.get_current_duration()));
+                                                });
+                                            });
+                                        }
+                                    }
+                                }
+                            });
+
+                        // Always show close button at the bottom
+                        ui.add_space(8.0);
+                        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                            if ui.button("Close").clicked() {
+                                self.show_statistics = false;
+                            }
                         });
                     });
             }
@@ -1109,7 +1410,6 @@ impl eframe::App for WorkTimer {
                                 _ => {}
                             }
 
-                            // Handle actions
                             let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                             
                             let mut should_close = false;
