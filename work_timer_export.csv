@@ -1,6 +1,2 @@
 Task,Duration (HH:MM:SS),Status
-test 2,00:00:00,Stopped
-testing 3,00:00:00,Stopped
-1345,00:00:03,Running
-testing 4,00:00:44,Running
-testing task,00:19:29,Paused
+test,00:00:00,Stopped

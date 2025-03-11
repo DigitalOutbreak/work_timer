@@ -1,6 +1,7 @@
 use chrono::{DateTime, Local};
 use csv;
-use eframe::egui;
+use eframe::{egui, epaint};
+use egui_phosphor::{regular, fill};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path, time::Duration};
 use uuid::Uuid;
@@ -55,14 +56,6 @@ impl Task {
         }
     }
 
-    fn stop(&mut self) {
-        if let Some(start) = self.start_time {
-            self.total_duration += Local::now().signed_duration_since(start).num_seconds();
-            self.start_time = None;
-        }
-        self.is_paused = false; // Reset paused state when completing the task
-    }
-
     fn get_current_duration(&self) -> i64 {
         let mut duration = self.total_duration;
         if let Some(start) = self.start_time {
@@ -90,7 +83,6 @@ enum TaskAction {
     Start,
     Pause,
     Resume,
-    Stop,
     Delete,
 }
 
@@ -104,15 +96,25 @@ struct WorkTimer {
     new_folder_input: String,
     selected_folder: Option<String>,
     show_new_folder_dialog: bool,
+    show_clear_folders_confirm: bool,
     dragged_task: Option<String>,
     show_clear_confirm: bool,
-    export_message: Option<(String, f32)>, // Message and time remaining
+    show_clear_folder_confirm: Option<String>,
+    show_delete_task_confirm: Option<String>,
+    export_message: Option<(String, f32)>,
     dark_mode: bool,
     show_shortcuts: bool,
     show_settings: bool,
     ui_scale: f32,
-    temporary_ui_scale: f32, // New field for temporary scale
+    temporary_ui_scale: f32,
     focus_new_task: bool,
+    focus_new_folder: bool,
+    show_add_task_dialog: bool,
+    add_task_to_folder: Option<String>,
+    new_task_in_folder: String,
+    dragged_folder: Option<String>,
+    focused_folder_index: Option<usize>,
+    focused_task_index: Option<usize>,
 }
 
 impl WorkTimer {
@@ -143,6 +145,8 @@ impl WorkTimer {
 
         let selected_folder = folders.first().cloned();
         let default_scale = 2.0;
+        let focused_folder_index = if !folders.is_empty() { Some(0) } else { None };
+        let focused_task_index = None;
 
         WorkTimer {
             tasks,
@@ -153,8 +157,11 @@ impl WorkTimer {
             new_folder_input: String::new(),
             selected_folder,
             show_new_folder_dialog: false,
+            show_clear_folders_confirm: false,
             dragged_task: None,
             show_clear_confirm: false,
+            show_clear_folder_confirm: None,
+            show_delete_task_confirm: None,
             export_message: None,
             dark_mode: true,
             show_shortcuts: false,
@@ -162,6 +169,13 @@ impl WorkTimer {
             ui_scale: default_scale,
             temporary_ui_scale: default_scale,
             focus_new_task: false,
+            focus_new_folder: false,
+            show_add_task_dialog: false,
+            add_task_to_folder: None,
+            new_task_in_folder: String::new(),
+            dragged_folder: None,
+            focused_folder_index,
+            focused_task_index,
         }
     }
 
@@ -183,6 +197,10 @@ impl WorkTimer {
             self.folders.sort();
             if self.selected_folder.is_none() {
                 self.selected_folder = Some(name);
+            }
+            // If there was no focused folder and this is the first folder, focus it
+            if self.focused_folder_index.is_none() {
+                self.focused_folder_index = Some(0);
             }
             self.save_tasks();
             self.save_folder_styles();
@@ -317,9 +335,27 @@ impl WorkTimer {
     }
 
     fn clear_folder(&mut self, folder_name: &str) {
-        self.tasks
-            .retain(|_, task| task.folder.as_deref() != Some(folder_name));
-        self.save_tasks();
+        // Remove the folder from the folders list
+        if let Some(index) = self.folders.iter().position(|f| f == folder_name) {
+            self.folders.remove(index);
+            self.folder_styles.remove(folder_name);
+            // If this was the selected folder, clear the selection
+            if self.selected_folder.as_deref() == Some(folder_name) {
+                self.selected_folder = self.folders.first().cloned();
+            }
+            // Update focused folder index if needed
+            if let Some(focused_idx) = self.focused_folder_index {
+                if focused_idx >= self.folders.len() {
+                    self.focused_folder_index = if self.folders.is_empty() {
+                        None
+                    } else {
+                        Some(self.folders.len() - 1)
+                    };
+                }
+            }
+            self.save_tasks();
+            self.save_folder_styles();
+        }
     }
 
     fn save_folder_styles(&self) {
@@ -409,13 +445,6 @@ impl WorkTimer {
                     });
                 }
 
-                // Show checkmark if task is running or paused
-                if task.start_time.is_some() || task.is_paused {
-                    if ui.button("✔").clicked() {
-                        action = Some(TaskAction::Stop);
-                    }
-                }
-
                 ui.label(task.format_duration());
 
                 let status_text = if task.start_time.is_some() {
@@ -436,8 +465,7 @@ impl WorkTimer {
     fn handle_task_action(&mut self, task_id: &str, action: TaskAction) {
         match action {
             TaskAction::Delete => {
-                self.tasks.remove(task_id);
-                self.save_tasks();
+                self.show_delete_task_confirm = Some(task_id.to_string());
             }
             _ => {
                 if let Some(task) = self.tasks.get_mut(task_id) {
@@ -445,12 +473,22 @@ impl WorkTimer {
                         TaskAction::Start => task.start(),
                         TaskAction::Pause => task.pause(),
                         TaskAction::Resume => task.resume(),
-                        TaskAction::Stop => task.stop(),
                         TaskAction::Delete => unreachable!(),
                     }
                 }
             }
         }
+    }
+
+    fn clear_all_folders(&mut self) {
+        self.folders.clear();
+        self.folder_styles.clear();
+        self.selected_folder = None;
+        // Reset focus but don't set to None - it will be set to Some(0) when a new folder is added
+        self.focused_folder_index = None;
+        self.focused_task_index = None;
+        self.save_tasks();
+        self.save_folder_styles();
     }
 }
 
@@ -458,9 +496,135 @@ impl eframe::App for WorkTimer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.configure_theme(ctx);
 
+        // Handle keyboard shortcuts and navigation
+        if !self.show_new_folder_dialog && !self.show_clear_folders_confirm && !self.show_clear_confirm 
+            && !self.show_clear_folder_confirm.is_some() && !self.show_delete_task_confirm.is_some() 
+            && !self.show_shortcuts && !self.show_settings && !self.show_add_task_dialog {
+            
+            // Handle space bar for play/pause
+            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                let folders = self.get_folders();
+                if let Some(current_folder_idx) = self.focused_folder_index {
+                    let folder_name = &folders[current_folder_idx];
+                    let folder_id = egui::Id::new(format!("folder_{}", folder_name));
+                    let is_open = ctx.memory(|mem| mem.data.get_temp::<bool>(folder_id).unwrap_or(true));
+                    
+                    // Only handle space if we have a focused task in an open folder
+                    if is_open && self.focused_task_index.is_some() {
+                        let tasks = self.get_tasks_by_folder();
+                        if let Some(task_ids) = tasks.get(folder_name.as_str()) {
+                            if let Some(task_idx) = self.focused_task_index {
+                                if let Some(task_id) = task_ids.get(task_idx) {
+                                    if let Some(task) = self.tasks.get(task_id) {
+                                        let action = if task.start_time.is_some() {
+                                            TaskAction::Pause
+                                        } else if task.is_paused {
+                                            TaskAction::Resume
+                                        } else {
+                                            TaskAction::Start
+                                        };
+                                        self.handle_task_action(task_id, action);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle Cmd+Delete for focused item
+            if ctx.input(|i| i.modifiers.command && (i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete))) {
+                let folders = self.get_folders();
+                if let Some(current_folder_idx) = self.focused_folder_index {
+                    let folder_name = &folders[current_folder_idx];
+                    let folder_id = egui::Id::new(format!("folder_{}", folder_name));
+                    let is_open = ctx.memory(|mem| mem.data.get_temp::<bool>(folder_id).unwrap_or(true));
+                    
+                    // If we have a focused task in an open folder, delete the task
+                    if is_open && self.focused_task_index.is_some() {
+                        let tasks = self.get_tasks_by_folder();
+                        if let Some(task_ids) = tasks.get(folder_name.as_str()) {
+                            if let Some(task_idx) = self.focused_task_index {
+                                if let Some(task_id) = task_ids.get(task_idx) {
+                                    self.show_delete_task_confirm = Some(task_id.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        // If we're on a folder header, delete the folder
+                        self.show_clear_folder_confirm = Some(folder_name.clone());
+                    }
+                }
+            }
+
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                let folders = self.get_folders();
+                if let Some(current_folder_idx) = self.focused_folder_index {
+                    let folder_name = &folders[current_folder_idx];
+                    let folder_id = egui::Id::new(format!("folder_{}", folder_name));
+                    let is_open = ctx.memory(|mem| mem.data.get_temp::<bool>(folder_id).unwrap_or(true));
+                    
+                    if is_open && self.focused_task_index.is_some() {
+                        // If we're focused on a task, move up through tasks
+                        if let Some(current_task_idx) = self.focused_task_index {
+                            if current_task_idx > 0 {
+                                self.focused_task_index = Some(current_task_idx - 1);
+                            } else {
+                                // If at first task, move to folder header
+                                self.focused_task_index = None;
+                            }
+                        }
+                    } else {
+                        // If we're on a folder header, move to previous folder
+                        if current_folder_idx > 0 {
+                            self.focused_folder_index = Some(current_folder_idx - 1);
+                            self.focused_task_index = None;
+                        }
+                    }
+                }
+            }
+
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                let folders = self.get_folders();
+                if let Some(current_folder_idx) = self.focused_folder_index {
+                    let folder_name = &folders[current_folder_idx];
+                    let folder_id = egui::Id::new(format!("folder_{}", folder_name));
+                    let is_open = ctx.memory(|mem| mem.data.get_temp::<bool>(folder_id).unwrap_or(true));
+                    let tasks = self.get_tasks_by_folder();
+                    let task_ids = tasks.get(folder_name.as_str()).cloned().unwrap_or_default();
+                    
+                    if is_open && !task_ids.is_empty() {
+                        // If folder is open and has tasks
+                        if self.focused_task_index.is_none() {
+                            // If on folder header, move to first task
+                            self.focused_task_index = Some(0);
+                        } else if let Some(current_task_idx) = self.focused_task_index {
+                            // If on a task, try to move to next task
+                            if current_task_idx < task_ids.len() - 1 {
+                                self.focused_task_index = Some(current_task_idx + 1);
+                            } else {
+                                // If at last task, move to next folder
+                                if current_folder_idx < folders.len() - 1 {
+                                    self.focused_folder_index = Some(current_folder_idx + 1);
+                                    self.focused_task_index = None;
+                                }
+                            }
+                        }
+                    } else {
+                        // If folder is closed or empty, move to next folder
+                        if current_folder_idx < folders.len() - 1 {
+                            self.focused_folder_index = Some(current_folder_idx + 1);
+                            self.focused_task_index = None;
+                        }
+                    }
+                }
+            }
+        }
+
         // Handle keyboard shortcuts
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
             self.show_new_folder_dialog = true;
+            self.focus_new_folder = true;
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E)) {
             if let Err(e) = self.export_to_csv() {
@@ -471,7 +635,17 @@ impl eframe::App for WorkTimer {
             self.dark_mode = !self.dark_mode;
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::T)) {
-            self.focus_new_task = true;
+            if let Some(focused_idx) = self.focused_folder_index {
+                // If a folder is focused, open the add task dialog for that folder
+                if let Some(folder_name) = self.folders.get(focused_idx) {
+                    self.show_add_task_dialog = true;
+                    self.add_task_to_folder = Some(folder_name.clone());
+                    self.new_task_in_folder.clear();
+                }
+            } else {
+                // If no folder is focused, focus the quick add task input
+                self.focus_new_task = true;
+            }
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             self.show_settings = true;
@@ -540,16 +714,149 @@ impl eframe::App for WorkTimer {
                             "Are you sure you want to clear all tasks? This cannot be undone.",
                         );
                         ui.horizontal(|ui| {
-                            if ui.button("Yes").clicked() {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            let yes_button = ui.add(egui::Button::new("Yes"));
+                            let no_button = ui.add(egui::Button::new("No"));
+                            
+                            let dialog_id = ui.id().with("clear_all_dialog");
+                            let focus_id = dialog_id.with("focus");
+                            
+                            // Initialize focus to "yes" if not set
+                            if !ui.memory(|mem| mem.data.get_temp::<bool>(focus_id).is_some()) {
+                                ui.memory_mut(|mem| mem.data.insert_temp(focus_id, true));  // true = yes focused
+                            }
+
+                            let mut yes_focused = ui.memory(|mem| mem.data.get_temp::<bool>(focus_id).unwrap_or(true));
+
+                            // Handle tab navigation
+                            if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                                yes_focused = !yes_focused;
+                                ui.memory_mut(|mem| mem.data.insert_temp(focus_id, yes_focused));
+                            }
+
+                            // Apply focus based on memory state
+                            if yes_focused {
+                                yes_button.request_focus();
+                            } else {
+                                no_button.request_focus();
+                            }
+
+                            if yes_button.clicked() || (yes_button.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                                 self.clear_all_tasks();
                                 self.show_clear_confirm = false;
                                 self.export_message = Some(("All tasks cleared".to_string(), 3.0));
                             }
-                            if ui.button("No").clicked() {
+                            if no_button.clicked() || (no_button.has_focus() && (ui.input(|i| i.key_pressed(egui::Key::Enter)) || ui.input(|i| i.key_pressed(egui::Key::Escape)))) {
                                 self.show_clear_confirm = false;
                             }
                         });
                     });
+            }
+
+            // Confirmation dialog for clearing a folder
+            if let Some(folder_name) = &self.show_clear_folder_confirm.clone() {
+                let folder_name = folder_name.clone();
+                egui::Window::new(format!("Clear Folder '{}'", folder_name))
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.label(format!(
+                            "Are you sure you want to delete the folder '{}'? This will remove the folder from the list. Tasks will remain in the system but will be uncategorized.",
+                            folder_name
+                        ));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            let yes_button = ui.add(egui::Button::new("Yes"));
+                            let no_button = ui.add(egui::Button::new("No"));
+                            
+                            let dialog_id = ui.id().with("clear_folder_dialog");
+                            let focus_id = dialog_id.with("focus");
+                            
+                            // Initialize focus to "yes" if not set
+                            if !ui.memory(|mem| mem.data.get_temp::<bool>(focus_id).is_some()) {
+                                ui.memory_mut(|mem| mem.data.insert_temp(focus_id, true));  // true = yes focused
+                            }
+
+                            let mut yes_focused = ui.memory(|mem| mem.data.get_temp::<bool>(focus_id).unwrap_or(true));
+
+                            // Handle tab navigation
+                            if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                                yes_focused = !yes_focused;
+                                ui.memory_mut(|mem| mem.data.insert_temp(focus_id, yes_focused));
+                            }
+
+                            // Apply focus based on memory state
+                            if yes_focused {
+                                yes_button.request_focus();
+                            } else {
+                                no_button.request_focus();
+                            }
+
+                            if yes_button.clicked() || (yes_button.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                self.clear_folder(&folder_name);
+                                self.show_clear_folder_confirm = None;
+                                self.export_message = Some((format!("Folder '{}' deleted", folder_name), 3.0));
+                            }
+                            if no_button.clicked() || (no_button.has_focus() && (ui.input(|i| i.key_pressed(egui::Key::Enter)) || ui.input(|i| i.key_pressed(egui::Key::Escape)))) {
+                                self.show_clear_folder_confirm = None;
+                            }
+                        });
+                    });
+            }
+
+            // Confirmation dialog for deleting a task
+            if let Some(task_id) = &self.show_delete_task_confirm.clone() {
+                let task_id = task_id.clone();
+                let task_info = self.tasks.get(&task_id).map(|task| (task.description.clone()));
+                if let Some(task_description) = task_info {
+                    egui::Window::new("Delete Task")
+                        .collapsible(false)
+                        .resizable(false)
+                        .show(ctx, |ui| {
+                            ui.label(format!(
+                                "Are you sure you want to delete task '{}'? This cannot be undone.",
+                                task_description
+                            ));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                let yes_button = ui.add(egui::Button::new("Yes"));
+                                let no_button = ui.add(egui::Button::new("No"));
+                                
+                                let dialog_id = ui.id().with("delete_task_dialog");
+                                let focus_id = dialog_id.with("focus");
+                                
+                                // Initialize focus to "yes" if not set
+                                if !ui.memory(|mem| mem.data.get_temp::<bool>(focus_id).is_some()) {
+                                    ui.memory_mut(|mem| mem.data.insert_temp(focus_id, true));  // true = yes focused
+                                }
+
+                                let mut yes_focused = ui.memory(|mem| mem.data.get_temp::<bool>(focus_id).unwrap_or(true));
+
+                                // Handle tab navigation
+                                if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                                    yes_focused = !yes_focused;
+                                    ui.memory_mut(|mem| mem.data.insert_temp(focus_id, yes_focused));
+                                }
+
+                                // Apply focus based on memory state
+                                if yes_focused {
+                                    yes_button.request_focus();
+                                } else {
+                                    no_button.request_focus();
+                                }
+
+                                if yes_button.clicked() || (yes_button.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                    self.tasks.remove(&task_id);
+                                    self.save_tasks();
+                                    self.show_delete_task_confirm = None;
+                                    self.export_message = Some((format!("Task '{}' deleted", task_description), 3.0));
+                                }
+                                if no_button.clicked() || (no_button.has_focus() && (ui.input(|i| i.key_pressed(egui::Key::Enter)) || ui.input(|i| i.key_pressed(egui::Key::Escape)))) {
+                                    self.show_delete_task_confirm = None;
+                                }
+                            });
+                        });
+                }
             }
 
             // Add the shortcuts popup window after the top bar
@@ -647,11 +954,61 @@ impl eframe::App for WorkTimer {
 
             // Folder selection and creation
             ui.horizontal(|ui| {
-                ui.label("Folder:");
                 if ui.button("📁 New Folder").clicked() {
                     self.show_new_folder_dialog = true;
+                    self.focus_new_folder = true;
+                }
+                if ui.button("🗑 Clear Folders").clicked() {
+                    self.show_clear_folders_confirm = true;
                 }
             });
+
+            // Confirmation dialog for clearing all folders
+            if self.show_clear_folders_confirm {
+                egui::Window::new("Clear All Folders")
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.label("Are you sure you want to clear all folders? This will remove all folder organization but keep your tasks. This cannot be undone.");
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            let yes_button = ui.add(egui::Button::new("Yes"));
+                            let no_button = ui.add(egui::Button::new("No"));
+                            
+                            let dialog_id = ui.id().with("clear_folders_dialog");
+                            let focus_id = dialog_id.with("focus");
+                            
+                            // Initialize focus to "yes" if not set
+                            if !ui.memory(|mem| mem.data.get_temp::<bool>(focus_id).is_some()) {
+                                ui.memory_mut(|mem| mem.data.insert_temp(focus_id, true));  // true = yes focused
+                            }
+
+                            let mut yes_focused = ui.memory(|mem| mem.data.get_temp::<bool>(focus_id).unwrap_or(true));
+
+                            // Handle tab navigation
+                            if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                                yes_focused = !yes_focused;
+                                ui.memory_mut(|mem| mem.data.insert_temp(focus_id, yes_focused));
+                            }
+
+                            // Apply focus based on memory state
+                            if yes_focused {
+                                yes_button.request_focus();
+                            } else {
+                                no_button.request_focus();
+                            }
+
+                            if yes_button.clicked() || (yes_button.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                self.clear_all_folders();
+                                self.show_clear_folders_confirm = false;
+                                self.export_message = Some(("All folders cleared".to_string(), 3.0));
+                            }
+                            if no_button.clicked() || (no_button.has_focus() && (ui.input(|i| i.key_pressed(egui::Key::Enter)) || ui.input(|i| i.key_pressed(egui::Key::Escape)))) {
+                                self.show_clear_folders_confirm = false;
+                            }
+                        });
+                    });
+            }
 
             // New folder dialog
             if self.show_new_folder_dialog {
@@ -661,17 +1018,67 @@ impl eframe::App for WorkTimer {
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             let text_edit = ui.text_edit_singleline(&mut self.new_folder_input);
-                            if ui.button("Create").clicked()
-                                || (text_edit.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                            {
-                                if !self.new_folder_input.trim().is_empty() {
-                                    self.add_folder(self.new_folder_input.trim().to_string());
-                                    self.new_folder_input.clear();
-                                    self.show_new_folder_dialog = false;
-                                }
+                            let create_button = ui.button("Create");
+                            let cancel_button = ui.button("Cancel");
+                            
+                            let dialog_id = ui.id().with("new_folder_dialog");
+                            let focus_id = dialog_id.with("focus");
+                            
+                            // Initialize focus state to text input (0) only when dialog opens
+                            if !ui.memory(|mem| mem.data.get_temp::<u8>(focus_id).is_some()) {
+                                ui.memory_mut(|mem| mem.data.insert_temp(focus_id, 0));
+                                text_edit.request_focus();
                             }
-                            if ui.button("Cancel").clicked() {
+
+                            let mut focus_state = ui.memory(|mem| mem.data.get_temp::<u8>(focus_id).unwrap_or(0));
+
+                            // Handle tab navigation
+                            if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                                if ui.input(|i| i.modifiers.shift) {
+                                    // Shift+Tab goes backwards
+                                    focus_state = if focus_state == 0 { 2 } else { focus_state - 1 };
+                                } else {
+                                    // Tab goes forwards
+                                    focus_state = if focus_state == 2 { 0 } else { focus_state + 1 };
+                                }
+                                ui.memory_mut(|mem| mem.data.insert_temp(focus_id, focus_state));
+                            }
+
+                            // Apply focus based on state
+                            match focus_state {
+                                0 => text_edit.request_focus(),
+                                1 => create_button.request_focus(),
+                                2 => cancel_button.request_focus(),
+                                _ => {}
+                            }
+
+                            // Handle actions
+                            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            
+                            let mut should_close = false;
+                            
+                            if (create_button.clicked() || (enter_pressed && focus_state == 1))
+                                && !self.new_folder_input.trim().is_empty()
+                            {
+                                self.add_folder(self.new_folder_input.trim().to_string());
+                                self.new_folder_input.clear();
+                                should_close = true;
+                            }
+                            
+                            // Only create folder from text input if Enter is pressed while focused
+                            if enter_pressed && focus_state == 0 && !self.new_folder_input.trim().is_empty() {
+                                self.add_folder(self.new_folder_input.trim().to_string());
+                                self.new_folder_input.clear();
+                                should_close = true;
+                            }
+                            
+                            if cancel_button.clicked() || (enter_pressed && focus_state == 2) || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                should_close = true;
+                            }
+
+                            if should_close {
+                                // Clear focus state from memory when closing
+                                ui.memory_mut(|mem| mem.data.remove::<u8>(focus_id));
                                 self.show_new_folder_dialog = false;
                                 self.new_folder_input.clear();
                             }
@@ -681,61 +1088,107 @@ impl eframe::App for WorkTimer {
 
             ui.add_space(16.0);
 
-            // New task input with folder selection
-            ui.horizontal(|ui| {
-                ui.label("Add task to folder:");
-                let selected_text = self
-                    .selected_folder
-                    .as_ref()
-                    .map(String::as_str)
-                    .unwrap_or("No folders");
-                egui::ComboBox::from_id_source("folder_selector")
-                    .selected_text(selected_text)
-                    .show_ui(ui, |ui| {
-                        for folder in &self.folders {
-                            let folder_str = folder.as_str();
-                            ui.selectable_value(
-                                &mut self.selected_folder,
-                                Some(folder_str.to_string()),
-                                folder_str,
-                            );
-                        }
-                    });
-            });
-
-            ui.horizontal(|ui| {
-                let response = ui.text_edit_singleline(&mut self.new_task_input);
-                if self.focus_new_task {
-                    response.request_focus();
-                    self.focus_new_task = false;
-                }
-                if ui.button("Add Task").clicked()
-                    || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                {
-                    if !self.new_task_input.trim().is_empty() {
-                        self.add_task(self.new_task_input.trim().to_string());
-                        self.new_task_input.clear();
-                    }
-                }
-            });
-
-            ui.add_space(16.0);
-
             // Display tasks by folder with custom colors
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let folders = self.get_folders();
                 let tasks_by_folder = self.get_tasks_by_folder();
 
-                for folder in folders {
-                    if let Some(task_ids) = tasks_by_folder.get(&folder) {
-                        let folder_name = folder.clone();
+                for (folder_idx, folder) in folders.iter().enumerate() {
+                    let folder_name = folder.clone();
+                    let task_ids = tasks_by_folder.get(folder_name.as_str()).cloned().unwrap_or_default();
 
-                        egui::Frame::none()
-                            .outer_margin(egui::style::Margin::symmetric(0.0, 2.0))
-                            .show(ui, |ui| {
-                                ui.collapsing(folder_name.clone(), |ui| {
-                                    // Add folder actions in a more compact layout
-                                    ui.horizontal(|ui| {
+                    egui::Frame::none()
+                        .outer_margin(egui::Vec2::splat(2.0))
+                        .show(ui, |ui| {
+                            let folder_id = egui::Id::new(format!("folder_{}", folder_name));
+                            let mut is_open = ui.memory_mut(|mem| {
+                                mem.data.get_temp::<bool>(folder_id).unwrap_or(true)
+                            });
+
+                            // Handle left/right arrow keys for the focused folder
+                            if Some(folder_idx) == self.focused_folder_index {
+                                if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && !is_open {
+                                    is_open = true;
+                                    ui.memory_mut(|mem| {
+                                        mem.data.insert_temp(folder_id, true);
+                                    });
+                                }
+                                if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && is_open {
+                                    is_open = false;
+                                    ui.memory_mut(|mem| {
+                                        mem.data.insert_temp(folder_id, false);
+                                    });
+                                }
+                            }
+
+                            // Header row with folder name and buttons
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+
+                                // Create a draggable button that contains the folder name and arrow
+                                let arrow = if is_open { fill::CARET_DOWN } else { fill::CARET_RIGHT };
+                                
+                                // Add visual feedback for focused folder
+                                let mut button = egui::Button::new(format!("{} {} ({})", arrow, folder_name, task_ids.len()))
+                                    .sense(egui::Sense::click_and_drag());
+                                
+                                if Some(folder_idx) == self.focused_folder_index {
+                                    button = button.fill(ui.visuals().selection.bg_fill);
+                                }
+                                
+                                let folder_button = ui.add(button);
+
+                                // Handle drag and drop
+                                if folder_button.drag_started() {
+                                    self.dragged_folder = Some(folder_name.clone());
+                                }
+                                
+                                if let Some(dragged_folder) = &self.dragged_folder {
+                                    if folder_button.dragged() {
+                                        // Show drag preview
+                                        ui.painter().rect_filled(
+                                            folder_button.rect,
+                                            4.0,
+                                            ui.visuals().selection.bg_fill.linear_multiply(0.3),
+                                        );
+                                    }
+                                    
+                                    if folder_button.drag_released() {
+                                        // Get the indices of the source and target folders
+                                        if let (Some(src_idx), Some(dst_idx)) = (
+                                            self.folders.iter().position(|f| f == dragged_folder),
+                                            self.folders.iter().position(|f| f == &folder_name),
+                                        ) {
+                                            // Don't swap with self
+                                            if src_idx != dst_idx {
+                                                // Remove from old position and insert at new position
+                                                let folder = self.folders.remove(src_idx);
+                                                self.folders.insert(dst_idx, folder);
+                                                self.save_tasks();
+                                            }
+                                        }
+                                        self.dragged_folder = None;
+                                    }
+                                }
+
+                                if folder_button.clicked() {
+                                    is_open = !is_open;
+                                    ui.memory_mut(|mem| {
+                                        mem.data.insert_temp(folder_id, is_open);
+                                    });
+                                }
+
+                                // Right side: Export and Clear buttons
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("🗑").clicked() {
+                                            self.show_clear_folder_confirm = Some(folder_name.clone());
+                                        }
+                                        ui.small("Clear");
+
+                                        ui.separator();
+
                                         if ui.button("📊").clicked() {
                                             match self.export_folder_to_csv(&folder_name) {
                                                 Ok(filename) => {
@@ -754,30 +1207,160 @@ impl eframe::App for WorkTimer {
                                         }
                                         ui.small("Export");
 
-                                        if ui.button("🗑").clicked() {
-                                            self.clear_folder(&folder_name);
-                                        }
-                                        ui.small("Clear");
-                                    });
+                                        ui.separator();
 
-                                    // Display tasks in the folder
-                                    for task_id in task_ids {
-                                        if let Some(task) = self.tasks.get(task_id) {
-                                            let (action, export_error) =
-                                                self.display_task(ui, task_id, task);
-                                            if let Some(action) = action {
-                                                self.handle_task_action(task_id, action);
+                                        if ui.button("➕").clicked() {
+                                            self.show_add_task_dialog = true;
+                                            self.add_task_to_folder = Some(folder_name.clone());
+                                            self.new_task_in_folder.clear();
+                                        }
+                                        ui.small("Add Task");
+                                    },
+                                );
+                            });
+
+                            // Collapsible content
+                            if is_open {
+                                ui.indent("tasks", |ui| {
+                                    if task_ids.is_empty() {
+                                        ui.add_space(4.0);
+                                        ui.label(egui::RichText::new("No tasks in this folder")
+                                            .italics()
+                                            .color(egui::Color32::from_rgb(128, 128, 128)));
+                                    } else {
+                                        // Display tasks in the folder
+                                        let mut task_action = None;
+                                        let mut task_action_id = None;
+                                        let mut task_export_error = None;
+
+                                        for (task_idx, task_id) in task_ids.iter().enumerate() {
+                                            if let Some(task) = self.tasks.get(task_id) {
+                                                let is_focused = Some(folder_idx) == self.focused_folder_index && 
+                                                              Some(task_idx) == self.focused_task_index;
+                                                
+                                                // Add a frame around the task if it's focused
+                                                let task_frame = egui::Frame::none()
+                                                    .fill(if is_focused { 
+                                                        ui.visuals().selection.bg_fill 
+                                                    } else { 
+                                                        egui::Color32::TRANSPARENT 
+                                                    });
+
+                                                task_frame.show(ui, |ui| {
+                                                    let (action, export_error) =
+                                                        self.display_task(ui, task_id, task);
+                                                    if action.is_some() {
+                                                        task_action = action;
+                                                        task_action_id = Some(task_id.to_string());
+                                                    }
+                                                    if export_error.is_some() {
+                                                        task_export_error = export_error;
+                                                    }
+                                                });
                                             }
-                                            if let Some(error) = export_error {
-                                                self.export_message = Some((error, 3.0));
+                                        }
+
+                                        // Handle any actions outside the closure
+                                        if let Some(action) = task_action {
+                                            if let Some(id) = task_action_id {
+                                                self.handle_task_action(&id, action);
                                             }
+                                        }
+                                        if let Some(error) = task_export_error {
+                                            self.export_message = Some((error, 3.0));
                                         }
                                     }
                                 });
-                            });
-                    }
+                            }
+                        });
                 }
             });
+
+            // Add task dialog
+            if self.show_add_task_dialog {
+                if let Some(folder_name) = &self.add_task_to_folder {
+                    let mut should_close = false;
+                    let mut should_add_task = false;
+                    let folder_name = folder_name.clone();
+
+                    egui::Window::new(format!("Add Task to '{}'", folder_name))
+                        .collapsible(false)
+                        .resizable(false)
+                        .show(ctx, |ui| {
+                            ui.horizontal(|ui| {
+                                let text_edit = ui.text_edit_singleline(&mut self.new_task_in_folder);
+                                let add_button = ui.button("Add");
+                                let cancel_button = ui.button("Cancel");
+                                
+                                let dialog_id = ui.id().with("add_task_dialog");
+                                let focus_id = dialog_id.with("focus");
+                                
+                                // Initialize focus state to text input (0) when dialog opens
+                                if !ui.memory(|mem| mem.data.get_temp::<u8>(focus_id).is_some()) {
+                                    ui.memory_mut(|mem| mem.data.insert_temp(focus_id, 0));
+                                    text_edit.request_focus();
+                                }
+
+                                let mut focus_state = ui.memory(|mem| mem.data.get_temp::<u8>(focus_id).unwrap_or(0));
+
+                                // Handle tab navigation
+                                if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                                    if ui.input(|i| i.modifiers.shift) {
+                                        // Shift+Tab goes backwards
+                                        focus_state = if focus_state == 0 { 2 } else { focus_state - 1 };
+                                    } else {
+                                        // Tab goes forwards
+                                        focus_state = if focus_state == 2 { 0 } else { focus_state + 1 };
+                                    }
+                                    ui.memory_mut(|mem| mem.data.insert_temp(focus_id, focus_state));
+                                }
+
+                                // Apply focus based on state
+                                match focus_state {
+                                    0 => text_edit.request_focus(),
+                                    1 => add_button.request_focus(),
+                                    2 => cancel_button.request_focus(),
+                                    _ => {}
+                                }
+
+                                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                                if (add_button.clicked() || (enter_pressed && focus_state == 1))
+                                    && !self.new_task_in_folder.trim().is_empty()
+                                {
+                                    should_add_task = true;
+                                    should_close = true;
+                                }
+
+                                if enter_pressed && focus_state == 0 && !self.new_task_in_folder.trim().is_empty() {
+                                    should_add_task = true;
+                                    should_close = true;
+                                }
+
+                                if cancel_button.clicked() || (enter_pressed && focus_state == 2) || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    should_close = true;
+                                }
+
+                                if should_close {
+                                    ui.memory_mut(|mem| mem.data.remove::<u8>(focus_id));
+                                }
+                            });
+                        });
+
+                    if should_add_task {
+                        let mut task = Task::new(self.new_task_in_folder.trim().to_string());
+                        task.folder = Some(folder_name);
+                        self.tasks.insert(task.id.clone(), task);
+                        self.save_tasks();
+                    }
+
+                    if should_close {
+                        self.show_add_task_dialog = false;
+                        self.add_task_to_folder = None;
+                        self.new_task_in_folder.clear();
+                    }
+                }
+            }
         });
 
         // Request repaint for timer updates
@@ -798,6 +1381,14 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Work Timer",
         options,
-        Box::new(|_cc| Box::new(WorkTimer::new())),
+        Box::new(|cc| {
+            // Load both regular and fill Phosphor icons fonts
+            let mut fonts = egui::FontDefinitions::default();
+            egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+            egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
+            cc.egui_ctx.set_fonts(fonts);
+            
+            Ok(Box::new(WorkTimer::new()) as Box<dyn eframe::App>)
+        }),
     )
 }
