@@ -823,9 +823,9 @@ impl eframe::App for WorkTimer {
                             let dialog_id = ui.id().with("clear_folder_dialog");
                             let focus_id = dialog_id.with("focus");
                             
-                            // Initialize focus to "yes" if not set
+                            // Initialize focus to "yes" only if focus state doesn't exist yet
                             if !ui.memory(|mem| mem.data.get_temp::<bool>(focus_id).is_some()) {
-                                ui.memory_mut(|mem| mem.data.insert_temp(focus_id, true));  // true = yes focused
+                                ui.memory_mut(|mem| mem.data.insert_temp(focus_id, true));
                             }
 
                             let mut yes_focused = ui.memory(|mem| mem.data.get_temp::<bool>(focus_id).unwrap_or(true));
@@ -846,10 +846,14 @@ impl eframe::App for WorkTimer {
                             if yes_button.clicked() || (yes_button.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                                 self.clear_folder(&folder_name);
                                 self.show_clear_folder_confirm = None;
+                                // Clear the focus state from memory when closing
+                                ui.memory_mut(|mem| mem.data.remove::<bool>(focus_id));
                                 self.export_message = Some((format!("Folder '{}' deleted", folder_name), 3.0));
                             }
                             if no_button.clicked() || (no_button.has_focus() && (ui.input(|i| i.key_pressed(egui::Key::Enter)) || ui.input(|i| i.key_pressed(egui::Key::Escape)))) {
                                 self.show_clear_folder_confirm = None;
+                                // Clear the focus state from memory when closing
+                                ui.memory_mut(|mem| mem.data.remove::<bool>(focus_id));
                             }
                         });
                     });
