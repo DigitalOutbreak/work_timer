@@ -433,19 +433,29 @@ impl WorkTimer {
         } else {
             egui::Visuals::light()
         };
-
-        // Customize the theme
+        
+        // Customize colors based on theme
         if self.dark_mode {
-            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(30, 30, 30);
-            visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(200, 200, 200);
+            visuals.override_text_color = Some(egui::Color32::from_rgb(230, 230, 230));
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(32, 33, 36);
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(45, 45, 48);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(55, 55, 58);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(48, 48, 51);
+            visuals.window_fill = egui::Color32::from_rgb(32, 33, 36);
+            visuals.panel_fill = egui::Color32::from_rgb(32, 33, 36);
         } else {
-            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(250, 250, 250);
-            visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(50, 50, 50);
+            visuals.override_text_color = Some(egui::Color32::from_rgb(25, 25, 25));
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(252, 252, 252);
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(248, 248, 248);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(240, 240, 240);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(235, 235, 235);
+            visuals.window_fill = egui::Color32::from_rgb(252, 252, 252);
+            visuals.panel_fill = egui::Color32::from_rgb(252, 252, 252);
         }
-
-        // Apply UI scaling
-        ctx.set_pixels_per_point(self.ui_scale);
+        
+        // Apply the styles
         ctx.set_visuals(visuals);
+        ctx.set_pixels_per_point(self.ui_scale);
     }
 
     fn get_folders(&self) -> Vec<String> {
@@ -602,31 +612,6 @@ impl eframe::App for WorkTimer {
         // Handle global shortcuts that should work even when dialogs are open
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
             self.dark_mode = !self.dark_mode;
-        }
-
-        // Handle statistics tab navigation globally
-        if self.show_statistics {
-            if ctx.input(|i| {
-                i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::OpenBracket)
-            }) {
-                // Move left in tabs
-                self.selected_stats_tab = match self.selected_stats_tab {
-                    StatsTab::Overview => StatsTab::Details,  // Wrap around to end
-                    StatsTab::Projects => StatsTab::Overview,
-                    StatsTab::Timeline => StatsTab::Projects,
-                    StatsTab::Details => StatsTab::Timeline,
-                };
-            } else if ctx.input(|i| {
-                i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::CloseBracket)
-            }) {
-                // Move right in tabs
-                self.selected_stats_tab = match self.selected_stats_tab {
-                    StatsTab::Overview => StatsTab::Projects,
-                    StatsTab::Projects => StatsTab::Timeline,
-                    StatsTab::Timeline => StatsTab::Details,
-                    StatsTab::Details => StatsTab::Overview,  // Wrap around to start
-                };
-            }
         }
 
         // Handle dialog closing with Escape or Cmd+W
