@@ -196,11 +196,12 @@ impl WorkTimer {
             self.folders.push(name.clone());
             self.folders.sort();
             if self.selected_folder.is_none() {
-                self.selected_folder = Some(name);
+                self.selected_folder = Some(name.clone());
             }
-            // If there was no focused folder and this is the first folder, focus it
-            if self.focused_folder_index.is_none() {
-                self.focused_folder_index = Some(0);
+            // Find the index of the newly added folder after sorting
+            if let Some(new_folder_idx) = self.folders.iter().position(|f| f == &name) {
+                self.focused_folder_index = Some(new_folder_idx);
+                self.focused_task_index = None; // Reset task focus when switching folders
             }
             self.save_tasks();
             self.save_folder_styles();
@@ -242,6 +243,20 @@ impl WorkTimer {
     fn clear_all_tasks(&mut self) {
         self.tasks.clear();
         self.save_tasks();
+        
+        // Clean up CSV files
+        let _ = fs::remove_file("work_timer_export.csv"); // Remove main export file
+        
+        // Remove individual task exports
+        if let Ok(entries) = fs::read_dir(".") {
+            for entry in entries.flatten() {
+                if let Ok(file_name) = entry.file_name().into_string() {
+                    if file_name.ends_with(".csv") {
+                        let _ = fs::remove_file(&file_name);
+                    }
+                }
+            }
+        }
     }
 
     fn get_unique_filename(&self, base_name: &str) -> String {
@@ -263,7 +278,7 @@ impl WorkTimer {
         let mut writer = csv::Writer::from_writer(file);
 
         // Write header
-        writer.write_record(&["Task", "Duration (HH:MM:SS)", "Status"])?;
+        writer.write_record(&["Task", "Project", "Duration (HH:MM:SS)", "Status"])?;
 
         // Write task
         let status = if task.start_time.is_some() {
@@ -274,7 +289,12 @@ impl WorkTimer {
             "Stopped"
         };
 
-        writer.write_record(&[&task.description, &task.format_duration(), status])?;
+        writer.write_record(&[
+            &task.description,
+            task.folder.as_deref().unwrap_or("Uncategorized"),
+            &task.format_duration(),
+            status
+        ])?;
         writer.flush()?;
         Ok(filename)
     }
@@ -285,7 +305,7 @@ impl WorkTimer {
         let mut writer = csv::Writer::from_writer(file);
 
         // Write header
-        writer.write_record(&["Task", "Duration (HH:MM:SS)", "Status"])?;
+        writer.write_record(&["Task", "Project", "Duration (HH:MM:SS)", "Status"])?;
 
         // Write tasks
         for task in self.tasks.values() {
@@ -297,7 +317,12 @@ impl WorkTimer {
                 "Stopped"
             };
 
-            writer.write_record(&[&task.description, &task.format_duration(), status])?;
+            writer.write_record(&[
+                &task.description,
+                task.folder.as_deref().unwrap_or("Uncategorized"),
+                &task.format_duration(),
+                status
+            ])?;
         }
 
         writer.flush()?;
@@ -313,7 +338,7 @@ impl WorkTimer {
         let mut writer = csv::Writer::from_writer(file);
 
         // Write header
-        writer.write_record(&["Task", "Duration (HH:MM:SS)", "Status"])?;
+        writer.write_record(&["Task", "Project", "Duration (HH:MM:SS)", "Status"])?;
 
         // Write tasks in this folder
         for task in self.tasks.values() {
@@ -326,7 +351,12 @@ impl WorkTimer {
                     "Stopped"
                 };
 
-                writer.write_record(&[&task.description, &task.format_duration(), status])?;
+                writer.write_record(&[
+                    &task.description,
+                    folder_name,
+                    &task.format_duration(),
+                    status
+                ])?;
             }
         }
 
@@ -335,6 +365,27 @@ impl WorkTimer {
     }
 
     fn clear_folder(&mut self, folder_name: &str) {
+        // Remove the folder's CSV export if it exists
+        let folder_csv = format!("folder_{}.csv", sanitize_filename(folder_name));
+        let _ = fs::remove_file(&folder_csv);
+
+        // Remove individual task CSV files for tasks in this folder
+        if let Ok(entries) = fs::read_dir(".") {
+            for entry in entries.flatten() {
+                if let Ok(file_name) = entry.file_name().into_string() {
+                    if file_name.ends_with(".csv") {
+                        // Check if this CSV belongs to a task in the folder
+                        if let Some(task) = self.tasks.values().find(|t| {
+                            t.folder.as_deref() == Some(folder_name) &&
+                            file_name == format!("{}.csv", sanitize_filename(&t.description))
+                        }) {
+                            let _ = fs::remove_file(&file_name);
+                        }
+                    }
+                }
+            }
+        }
+
         // Remove the folder from the folders list
         if let Some(index) = self.folders.iter().position(|f| f == folder_name) {
             self.folders.remove(index);
@@ -545,9 +596,7 @@ impl eframe::App for WorkTimer {
                         let tasks = self.get_tasks_by_folder();
                         if let Some(task_ids) = tasks.get(folder_name.as_str()) {
                             if let Some(task_idx) = self.focused_task_index {
-                                if let Some(task_id) = task_ids.get(task_idx) {
-                                    self.show_delete_task_confirm = Some(task_id.clone());
-                                }
+                                self.show_delete_task_confirm = Some(task_ids[task_idx].clone());
                             }
                         }
                     } else {
@@ -670,22 +719,24 @@ impl eframe::App for WorkTimer {
 
                 ui.separator();
 
-                if ui.button("📊 Export All Tasks").clicked() {
-                    match self.export_to_csv() {
-                        Ok(filename) => {
-                            self.export_message =
-                                Some((format!("Tasks exported to {}", filename), 3.0));
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to export CSV: {}", e);
-                            self.export_message =
-                                Some((format!("Error exporting CSV: {}", e), 3.0));
+                if !self.tasks.is_empty() {
+                    if ui.button("📊 Export All Tasks").clicked() {
+                        match self.export_to_csv() {
+                            Ok(filename) => {
+                                self.export_message =
+                                    Some((format!("Tasks exported to {}", filename), 3.0));
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to export CSV: {}", e);
+                                self.export_message =
+                                    Some((format!("Error exporting CSV: {}", e), 3.0));
+                            }
                         }
                     }
-                }
 
-                if ui.button("🗑 Clear All Tasks").clicked() {
-                    self.show_clear_confirm = true;
+                    if ui.button("🗑 Clear All Tasks").clicked() {
+                        self.show_clear_confirm = true;
+                    }
                 }
             });
 
@@ -958,8 +1009,10 @@ impl eframe::App for WorkTimer {
                     self.show_new_folder_dialog = true;
                     self.focus_new_folder = true;
                 }
-                if ui.button("🗑 Clear Folders").clicked() {
-                    self.show_clear_folders_confirm = true;
+                if !self.folders.is_empty() {
+                    if ui.button("🗑 Clear Folders").clicked() {
+                        self.show_clear_folders_confirm = true;
+                    }
                 }
             });
 
