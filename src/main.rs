@@ -109,6 +109,9 @@ struct WorkTimer {
     export_message: Option<(String, f32)>, // Message and time remaining
     dark_mode: bool,
     show_shortcuts: bool,
+    show_settings: bool,
+    ui_scale: f32,
+    temporary_ui_scale: f32, // New field for temporary scale
     focus_new_task: bool,
 }
 
@@ -139,6 +142,7 @@ impl WorkTimer {
         };
 
         let selected_folder = folders.first().cloned();
+        let default_scale = 2.0;
 
         WorkTimer {
             tasks,
@@ -154,6 +158,9 @@ impl WorkTimer {
             export_message: None,
             dark_mode: true,
             show_shortcuts: false,
+            show_settings: false,
+            ui_scale: default_scale,
+            temporary_ui_scale: default_scale,
             focus_new_task: false,
         }
     }
@@ -337,6 +344,8 @@ impl WorkTimer {
             visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(50, 50, 50);
         }
 
+        // Apply UI scaling
+        ctx.set_pixels_per_point(self.ui_scale);
         ctx.set_visuals(visuals);
     }
 
@@ -464,6 +473,9 @@ impl eframe::App for WorkTimer {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::T)) {
             self.focus_new_task = true;
         }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+            self.show_settings = true;
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Work Timer");
@@ -472,6 +484,10 @@ impl eframe::App for WorkTimer {
             ui.horizontal(|ui| {
                 if ui.button(if self.dark_mode { "☀" } else { "🌙" }).clicked() {
                     self.dark_mode = !self.dark_mode;
+                }
+
+                if ui.button("⚙").clicked() {
+                    self.show_settings = true;
                 }
 
                 if ui.button("⌨").clicked() {
@@ -575,6 +591,54 @@ impl eframe::App for WorkTimer {
                             if ui.button("Close").clicked() {
                                 self.show_shortcuts = false;
                             }
+                        });
+                    });
+            }
+
+            // Add the settings popup window
+            if self.show_settings {
+                egui::Window::new("Settings")
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.heading("UI Scale");
+                        ui.add_space(4.0);
+
+                        ui.horizontal(|ui| {
+                            if ui.button("➖").clicked() && self.temporary_ui_scale > 1.0 {
+                                self.temporary_ui_scale = (self.temporary_ui_scale - 0.1).max(1.0);
+                            }
+
+                            ui.add(
+                                egui::Slider::new(&mut self.temporary_ui_scale, 1.0..=2.5)
+                                    .step_by(0.1)
+                                    .text("Scale"),
+                            );
+
+                            if ui.button("➕").clicked() && self.temporary_ui_scale < 2.5 {
+                                self.temporary_ui_scale = (self.temporary_ui_scale + 0.1).min(2.5);
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Revert to Default").clicked() {
+                                self.temporary_ui_scale = 2.0;
+                            }
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Close").clicked() {
+                                        self.temporary_ui_scale = self.ui_scale; // Reset temporary scale
+                                        self.show_settings = false;
+                                    }
+                                    if ui.button("Apply").clicked() {
+                                        self.ui_scale = self.temporary_ui_scale;
+                                        ctx.set_pixels_per_point(self.ui_scale);
+                                    }
+                                },
+                            );
                         });
                     });
             }
