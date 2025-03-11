@@ -1435,6 +1435,38 @@ impl eframe::App for WorkTimer {
                 let folders = self.get_folders();
                 let tasks_by_folder = self.get_tasks_by_folder();
 
+                // Add a drop target at the top of the list
+                if let Some(dragged_folder) = &self.dragged_folder {
+                    let top_rect = ui.available_rect_before_wrap();
+                    let top_indicator_rect = egui::Rect::from_min_max(
+                        top_rect.left_top(),
+                        top_rect.right_top() + egui::vec2(0.0, 4.0),
+                    );
+
+                    let response = ui.allocate_rect(top_indicator_rect, egui::Sense::hover());
+                    if response.hovered() {
+                        // Show insertion indicator at the top
+                        ui.painter().rect_filled(
+                            top_indicator_rect,
+                            0.0,
+                            ui.visuals().selection.stroke.color,
+                        );
+
+                        // Handle dropping at the top
+                        if ui.input(|i| i.pointer.any_released()) {
+                            if let Some(src_idx) = self.folders.iter().position(|f| f == dragged_folder) {
+                                let folder = self.folders.remove(src_idx);
+                                self.folders.insert(0, folder);
+                                if self.focused_folder_index == Some(src_idx) {
+                                    self.focused_folder_index = Some(0);
+                                }
+                                self.save_tasks();
+                            }
+                            self.dragged_folder = None;
+                        }
+                    }
+                }
+
                 for (folder_idx, folder) in folders.iter().enumerate() {
                     let folder_name = folder.clone();
                     let task_ids = tasks_by_folder.get(folder_name.as_str()).cloned().unwrap_or_default();
@@ -1487,29 +1519,77 @@ impl eframe::App for WorkTimer {
                                 
                                 if let Some(dragged_folder) = &self.dragged_folder {
                                     if folder_button.dragged() {
-                                        // Show drag preview
-                                        ui.painter().rect_filled(
-                                            folder_button.rect,
-                                            4.0,
-                                            ui.visuals().selection.bg_fill.linear_multiply(0.3),
+                                        // Show drag preview with improved visual feedback
+                                        let rect = folder_button.rect.expand(2.0);
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            0.0,
+                                            egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                                            egui::epaint::StrokeKind::Inside,
                                         );
                                     }
                                     
-                                    if folder_button.drag_released() {
-                                        // Get the indices of the source and target folders
-                                        if let (Some(src_idx), Some(dst_idx)) = (
-                                            self.folders.iter().position(|f| f == dragged_folder),
-                                            self.folders.iter().position(|f| f == &folder_name),
-                                        ) {
-                                            // Don't swap with self
-                                            if src_idx != dst_idx {
-                                                // Remove from old position and insert at new position
-                                                let folder = self.folders.remove(src_idx);
-                                                self.folders.insert(dst_idx, folder);
-                                                self.save_tasks();
+                                    // Only show drop indicators if we're not dragging the current folder
+                                    if dragged_folder != &folder_name {
+                                        let src_idx = self.folders.iter().position(|f| f == dragged_folder);
+                                        let hover_rect = folder_button.rect.expand(4.0);
+                                        
+                                        if ui.rect_contains_pointer(hover_rect) {
+                                            let is_below = ui.input(|i| {
+                                                i.pointer.hover_pos().map_or(false, |pos| pos.y > folder_button.rect.center().y)
+                                            });
+                                            
+                                            // Only show indicator if dropping would result in a meaningful reorder
+                                            let should_show_indicator = if let Some(src_idx) = src_idx {
+                                                if is_below {
+                                                    // When dropping below, only show if source is above this folder
+                                                    src_idx < folder_idx
+                                                } else {
+                                                    // When dropping above, only show if source is below this folder
+                                                    src_idx > folder_idx
+                                                }
+                                            } else {
+                                                false
+                                            };
+                                            
+                                            if should_show_indicator {
+                                                let indicator_rect = if is_below {
+                                                    egui::Rect::from_min_max(
+                                                        folder_button.rect.left_bottom() + egui::vec2(0.0, 2.0),
+                                                        folder_button.rect.right_bottom() + egui::vec2(0.0, 4.0),
+                                                    )
+                                                } else {
+                                                    egui::Rect::from_min_max(
+                                                        folder_button.rect.left_top() - egui::vec2(0.0, 4.0),
+                                                        folder_button.rect.right_top() - egui::vec2(0.0, 2.0),
+                                                    )
+                                                };
+                                                
+                                                ui.painter().rect_filled(
+                                                    indicator_rect,
+                                                    0.0,
+                                                    ui.visuals().selection.stroke.color,
+                                                );
+                                                
+                                                // Handle dropping near a folder
+                                                if ui.input(|i| i.pointer.any_released()) {
+                                                    if let Some(src_idx) = src_idx {
+                                                        let folder = self.folders.remove(src_idx);
+                                                        let insert_idx = if is_below {
+                                                            (folder_idx + 1).min(self.folders.len())
+                                                        } else {
+                                                            folder_idx
+                                                        };
+                                                        self.folders.insert(insert_idx, folder);
+                                                        if self.focused_folder_index == Some(src_idx) {
+                                                            self.focused_folder_index = Some(insert_idx);
+                                                        }
+                                                        self.save_tasks();
+                                                    }
+                                                    self.dragged_folder = None;
+                                                }
                                             }
                                         }
-                                        self.dragged_folder = None;
                                     }
                                 }
 
