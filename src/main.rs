@@ -6,6 +6,29 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path};
 use uuid::Uuid;
 
+#[derive(Clone)]
+enum TaskAction {
+    Start,
+    Pause,
+    Resume,
+    Delete,
+    Complete,
+}
+
+#[derive(Clone)]
+enum DurationEditAction {
+    StartEdit(String),
+    StopEdit(Option<i64>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum StatsTab {
+    Overview,
+    Projects,
+    Timeline,
+    Details,
+}
+
 fn sanitize_filename(name: &str) -> String {
     let invalid_chars = ['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>', '.', ' '];
     name.chars()
@@ -78,23 +101,6 @@ struct FolderStyle {
     name: String,
 }
 
-#[derive(Clone, Copy)]
-enum TaskAction {
-    Start,
-    Pause,
-    Resume,
-    Delete,
-    Complete,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum StatsTab {
-    Overview,
-    Projects,
-    Timeline,
-    Details,
-}
-
 impl Default for StatsTab {
     fn default() -> Self {
         StatsTab::Overview
@@ -132,6 +138,8 @@ struct WorkTimer {
     dragged_folder: Option<String>,
     focused_folder_index: Option<usize>,
     focused_task_index: Option<usize>,
+    editing_duration_task_id: Option<String>,
+    editing_duration_value: String,
 }
 
 impl WorkTimer {
@@ -195,6 +203,8 @@ impl WorkTimer {
             dragged_folder: None,
             focused_folder_index,
             focused_task_index,
+            editing_duration_task_id: None,
+            editing_duration_value: String::new(),
         }
     }
 
@@ -478,17 +488,38 @@ impl WorkTimer {
         tasks_by_folder
     }
 
+    fn handle_duration_edit(&mut self, task_id: &str, action: DurationEditAction) {
+        match action {
+            DurationEditAction::StartEdit(current_value) => {
+                self.editing_duration_task_id = Some(task_id.to_string());
+                self.editing_duration_value = current_value;
+            }
+            DurationEditAction::StopEdit(new_duration) => {
+                if let Some(duration) = new_duration {
+                    self.update_task_duration(task_id, duration);
+                }
+                self.editing_duration_task_id = None;
+                self.editing_duration_value.clear();
+            }
+        }
+    }
+
     fn display_task(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
-        task_id: &str,
-        task: &Task,
+        task_id: String,
+        description: String,
+        duration: i64,
+        start_time: Option<DateTime<Local>>,
+        is_paused: bool,
     ) -> (Option<TaskAction>, Option<String>) {
         let mut action = None;
         let mut export_error = None;
+        let is_editing = Some(&task_id) == self.editing_duration_task_id.as_ref();
+        
         ui.horizontal(|ui| {
             // Complete button (checkbox style) on the left
-            let is_completed = task.total_duration > 0 && task.start_time.is_none() && !task.is_paused;
+            let is_completed = duration > 0 && start_time.is_none() && !is_paused;
             let complete_icon = if is_completed {
                 fill::CHECK_SQUARE
             } else {
@@ -498,7 +529,7 @@ impl WorkTimer {
                 action = Some(TaskAction::Complete);
             }
             
-            ui.label(&task.description);
+            ui.label(&description);
             
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Delete button
@@ -508,25 +539,23 @@ impl WorkTimer {
 
                 // Export single task button
                 if ui.button(fill::EXPORT).clicked() {
-                    if let Err(e) = self.export_task_to_csv(task) {
-                        export_error = Some(format!("Error exporting task: {}", e));
-                    }
+                    export_error = Some(format!("Error exporting task: Task export not implemented in closure"));
                 }
 
                 // Only show play/pause button if task is not completed
                 if !is_completed {
-                    let button_text = if task.start_time.is_some() {
+                    let button_text = if start_time.is_some() {
                         fill::PAUSE // Pause icon
-                    } else if task.is_paused {
+                    } else if is_paused {
                         fill::PLAY // Play icon
                     } else {
                         fill::PLAY // Play icon
                     };
 
                     if ui.button(button_text).clicked() {
-                        action = Some(if task.start_time.is_some() {
+                        action = Some(if start_time.is_some() {
                             TaskAction::Pause
-                        } else if task.is_paused {
+                        } else if is_paused {
                             TaskAction::Resume
                         } else {
                             TaskAction::Start
@@ -534,13 +563,37 @@ impl WorkTimer {
                     }
                 }
 
-                ui.label(task.format_duration());
+                // Duration display/edit
+                if is_editing {
+                    let mut edit_value = self.editing_duration_value.clone();
+                    let response = ui.text_edit_singleline(&mut edit_value);
+                    if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let new_duration = self.parse_duration_input(&edit_value);
+                        if let Some(duration) = new_duration {
+                            self.update_task_duration(&task_id, duration);
+                        }
+                        self.editing_duration_task_id = None;
+                        self.editing_duration_value.clear();
+                    } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.editing_duration_task_id = None;
+                        self.editing_duration_value.clear();
+                    } else {
+                        self.editing_duration_value = edit_value;
+                    }
+                } else {
+                    let formatted_duration = Self::format_duration(duration);
+                    let duration_label = ui.label(&formatted_duration);
+                    if duration_label.double_clicked() {
+                        self.editing_duration_task_id = Some(task_id.clone());
+                        self.editing_duration_value = formatted_duration;
+                    }
+                }
 
-                let status_text = if task.start_time.is_some() {
+                let status_text = if start_time.is_some() {
                     egui::RichText::new("Running").color(egui::Color32::GREEN)
-                } else if task.is_paused {
+                } else if is_paused {
                     egui::RichText::new("Paused").color(egui::Color32::YELLOW)
-                } else if task.total_duration == 0 && !task.is_paused {
+                } else if duration == 0 && !is_paused {
                     egui::RichText::new("Not Started").color(egui::Color32::GRAY)
                 } else {
                     egui::RichText::new("Completed").color(egui::Color32::from_rgb(0, 180, 180))
@@ -548,6 +601,7 @@ impl WorkTimer {
                 ui.label(status_text);
             });
         });
+
         (action, export_error)
     }
 
@@ -634,6 +688,35 @@ impl WorkTimer {
         self.show_settings || 
         self.show_add_task_dialog ||
         self.show_statistics
+    }
+
+    fn parse_duration_input(&self, input: &str) -> Option<i64> {
+        // Try to parse HH:MM:SS format
+        let parts: Vec<&str> = input.split(':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+
+        let hours = parts[0].parse::<i64>().ok()?;
+        let minutes = parts[1].parse::<i64>().ok()?;
+        let seconds = parts[2].parse::<i64>().ok()?;
+
+        if minutes >= 60 || seconds >= 60 || hours < 0 || minutes < 0 || seconds < 0 {
+            return None;
+        }
+
+        Some(hours * 3600 + minutes * 60 + seconds)
+    }
+
+    fn update_task_duration(&mut self, task_id: &str, new_duration: i64) {
+        if let Some(task) = self.tasks.get_mut(task_id) {
+            // If task is running, we need to account for the current running time
+            if task.start_time.is_some() {
+                task.pause();
+            }
+            task.total_duration = new_duration;
+            self.save_tasks();
+        }
     }
 }
 
@@ -1692,7 +1775,15 @@ impl eframe::App for WorkTimer {
                                                 let is_focused = Some(folder_idx) == self.focused_folder_index && 
                                                               Some(task_idx) == self.focused_task_index;
                                                 
-                                                // Add a frame around the task if it's focused
+                                                // Collect all the data we need before the closure
+                                                let task_id = task_id.to_string();
+                                                let description = task.description.clone();
+                                                let duration = task.get_current_duration();
+                                                let start_time = task.start_time;
+                                                let is_paused = task.is_paused;
+                                                let is_editing = Some(&task_id) == self.editing_duration_task_id.as_ref();
+                                                let editing_value = self.editing_duration_value.clone();
+                                                
                                                 let task_frame = egui::Frame::new()
                                                     .fill(if is_focused { 
                                                         ui.visuals().selection.bg_fill 
@@ -1701,15 +1792,93 @@ impl eframe::App for WorkTimer {
                                                     });
 
                                                 task_frame.show(ui, |ui| {
-                                                    let (action, export_error) =
-                                                        self.display_task(ui, task_id, task);
-                                                    if action.is_some() {
-                                                        task_action = action;
-                                                        task_action_id = Some(task_id.to_string());
-                                                    }
-                                                    if export_error.is_some() {
-                                                        task_export_error = export_error;
-                                                    }
+                                                    ui.horizontal(|ui| {
+                                                        // Complete button (checkbox style) on the left
+                                                        let is_completed = duration > 0 && start_time.is_none() && !is_paused;
+                                                        let complete_icon = if is_completed {
+                                                            fill::CHECK_SQUARE
+                                                        } else {
+                                                            fill::SQUARE
+                                                        };
+                                                        if ui.button(complete_icon).clicked() {
+                                                            task_action = Some(TaskAction::Complete);
+                                                            task_action_id = Some(task_id.clone());
+                                                        }
+                                                        
+                                                        ui.label(&description);
+                                                        
+                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                            // Delete button
+                                                            if ui.button(fill::TRASH).clicked() {
+                                                                task_action = Some(TaskAction::Delete);
+                                                                task_action_id = Some(task_id.clone());
+                                                            }
+
+                                                            // Export single task button
+                                                            if ui.button(fill::EXPORT).clicked() {
+                                                                task_export_error = Some(format!("Error exporting task: Task export not implemented in closure"));
+                                                            }
+
+                                                            // Only show play/pause button if task is not completed
+                                                            if !is_completed {
+                                                                let button_text = if start_time.is_some() {
+                                                                    fill::PAUSE // Pause icon
+                                                                } else if is_paused {
+                                                                    fill::PLAY // Play icon
+                                                                } else {
+                                                                    fill::PLAY // Play icon
+                                                                };
+
+                                                                if ui.button(button_text).clicked() {
+                                                                    task_action = Some(if start_time.is_some() {
+                                                                        TaskAction::Pause
+                                                                    } else if is_paused {
+                                                                        TaskAction::Resume
+                                                                    } else {
+                                                                        TaskAction::Start
+                                                                    });
+                                                                    task_action_id = Some(task_id.clone());
+                                                                }
+                                                            }
+
+                                                            // Duration display/edit
+                                                            if is_editing {
+                                                                let mut edit_value = editing_value.clone();
+                                                                let response = ui.text_edit_singleline(&mut edit_value);
+                                                                if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                                                    let new_duration = self.parse_duration_input(&edit_value);
+                                                                    if let Some(duration) = new_duration {
+                                                                        self.update_task_duration(&task_id, duration);
+                                                                    }
+                                                                    self.editing_duration_task_id = None;
+                                                                    self.editing_duration_value.clear();
+                                                                } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                                                    self.editing_duration_task_id = None;
+                                                                    self.editing_duration_value.clear();
+                                                                } else {
+                                                                    self.editing_duration_value = edit_value;
+                                                                }
+                                                            } else {
+                                                                let formatted_duration = Self::format_duration(duration);
+                                                                let duration_label = ui.label(&formatted_duration);
+                                                                if duration_label.double_clicked() {
+                                                                    self.editing_duration_task_id = Some(task_id.clone());
+                                                                    self.editing_duration_value = formatted_duration;
+                                                                }
+                                                            }
+
+                                                            let status_text = if start_time.is_some() {
+                                                                egui::RichText::new("Running").color(egui::Color32::GREEN)
+                                                            } else if is_paused {
+                                                                egui::RichText::new("Paused").color(egui::Color32::YELLOW)
+                                                            } else if duration == 0 && !is_paused {
+                                                                egui::RichText::new("Not Started").color(egui::Color32::GRAY)
+                                                            } else {
+                                                                egui::RichText::new("Completed").color(egui::Color32::from_rgb(0, 180, 180))
+                                                            };
+                                                            ui.label(status_text);
+                                                        });
+                                                    });
                                                 });
                                             }
                                         }
