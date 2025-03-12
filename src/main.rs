@@ -1,9 +1,9 @@
 use chrono::{DateTime, Local};
 use csv;
-use eframe::{egui, epaint};
-use egui_phosphor::{regular, fill};
+use eframe::egui;
+use egui_phosphor::fill;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::Path, time::Duration};
+use std::{collections::HashMap, fs, path::Path};
 use uuid::Uuid;
 
 fn sanitize_filename(name: &str) -> String {
@@ -84,6 +84,7 @@ enum TaskAction {
     Pause,
     Resume,
     Delete,
+    Complete,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -486,36 +487,51 @@ impl WorkTimer {
         let mut action = None;
         let mut export_error = None;
         ui.horizontal(|ui| {
+            // Complete button (checkbox style) on the left
+            let is_completed = task.total_duration > 0 && task.start_time.is_none() && !task.is_paused;
+            let complete_icon = if is_completed {
+                fill::CHECK_SQUARE
+            } else {
+                fill::SQUARE
+            };
+            if ui.button(complete_icon).clicked() {
+                action = Some(TaskAction::Complete);
+            }
+            
             ui.label(&task.description);
+            
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Delete button
-                if ui.button("🗑").clicked() {
+                if ui.button(fill::TRASH).clicked() {
                     action = Some(TaskAction::Delete);
                 }
 
                 // Export single task button
-                if ui.button("📄").clicked() {
+                if ui.button(fill::EXPORT).clicked() {
                     if let Err(e) = self.export_task_to_csv(task) {
                         export_error = Some(format!("Error exporting task: {}", e));
                     }
                 }
 
-                let button_text = if task.start_time.is_some() {
-                    "⏸"
-                } else if task.is_paused {
-                    "▶"
-                } else {
-                    "▶"
-                };
-
-                if ui.button(button_text).clicked() {
-                    action = Some(if task.start_time.is_some() {
-                        TaskAction::Pause
+                // Only show play/pause button if task is not completed
+                if !is_completed {
+                    let button_text = if task.start_time.is_some() {
+                        fill::PAUSE // Pause icon
                     } else if task.is_paused {
-                        TaskAction::Resume
+                        fill::PLAY // Play icon
                     } else {
-                        TaskAction::Start
-                    });
+                        fill::PLAY // Play icon
+                    };
+
+                    if ui.button(button_text).clicked() {
+                        action = Some(if task.start_time.is_some() {
+                            TaskAction::Pause
+                        } else if task.is_paused {
+                            TaskAction::Resume
+                        } else {
+                            TaskAction::Start
+                        });
+                    }
                 }
 
                 ui.label(task.format_duration());
@@ -527,7 +543,7 @@ impl WorkTimer {
                 } else if task.total_duration == 0 && !task.is_paused {
                     egui::RichText::new("Not Started").color(egui::Color32::GRAY)
                 } else {
-                    egui::RichText::new("Completed ✔").color(egui::Color32::from_rgb(0, 180, 180))
+                    egui::RichText::new("Completed").color(egui::Color32::from_rgb(0, 180, 180))
                 };
                 ui.label(status_text);
             });
@@ -540,13 +556,29 @@ impl WorkTimer {
             TaskAction::Delete => {
                 self.show_delete_task_confirm = Some(task_id.to_string());
             }
+            TaskAction::Complete => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    let is_completed = task.total_duration > 0 && task.start_time.is_none() && !task.is_paused;
+                    if is_completed {
+                        // If task is completed, mark it as incomplete by setting is_paused to true
+                        task.is_paused = true;
+                    } else {
+                        // If task is not completed, mark it as completed
+                        if task.start_time.is_some() {
+                            task.pause(); // Stop the timer if it's running
+                        }
+                        task.is_paused = false; // Mark as not paused
+                    }
+                    self.save_tasks();
+                }
+            }
             _ => {
                 if let Some(task) = self.tasks.get_mut(task_id) {
                     match action {
                         TaskAction::Start => task.start(),
                         TaskAction::Pause => task.pause(),
                         TaskAction::Resume => task.resume(),
-                        TaskAction::Delete => unreachable!(),
+                        TaskAction::Delete | TaskAction::Complete => unreachable!(),
                     }
                 }
             }
@@ -1471,7 +1503,7 @@ impl eframe::App for WorkTimer {
                     let folder_name = folder.clone();
                     let task_ids = tasks_by_folder.get(folder_name.as_str()).cloned().unwrap_or_default();
 
-                    egui::Frame::none()
+                    egui::Frame::new()
                         .outer_margin(egui::Vec2::splat(2.0))
                         .show(ui, |ui| {
                             let folder_id = egui::Id::new(format!("folder_{}", folder_name));
@@ -1661,7 +1693,7 @@ impl eframe::App for WorkTimer {
                                                               Some(task_idx) == self.focused_task_index;
                                                 
                                                 // Add a frame around the task if it's focused
-                                                let task_frame = egui::Frame::none()
+                                                let task_frame = egui::Frame::new()
                                                     .fill(if is_focused { 
                                                         ui.visuals().selection.bg_fill 
                                                     } else { 
